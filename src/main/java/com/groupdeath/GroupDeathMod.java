@@ -2,25 +2,16 @@ package com.groupdeath;
 
 import net.fabricmc.api.ModInitializer;
 import net.fabricmc.fabric.api.entity.event.v1.ServerLivingEntityEvents;
-import net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents;
-import net.minecraft.network.chat.Component;
-import net.minecraft.network.protocol.game.ClientboundPlayerCombatKillPacket;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.level.gamerules.GameRules;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
-import java.util.Collections;
-import java.util.Set;
-import java.util.UUID;
-import java.util.concurrent.ConcurrentHashMap;
 
 public class GroupDeathMod implements ModInitializer {
 
     public static final String MOD_ID = "groupdeath";
     public static final Logger LOGGER = LoggerFactory.getLogger(MOD_ID);
-
-    public static final Set<UUID> FAKE_DEAD = Collections.newSetFromMap(new ConcurrentHashMap<>());
 
     @Override
     public void onInitialize() {
@@ -29,18 +20,22 @@ public class GroupDeathMod implements ModInitializer {
             MinecraftServer server = dead.level().getServer();
             if (server == null) return;
 
-            Component deathMessage = source.getLocalizedDeathMessage(dead);
-
-            for (ServerPlayer other : server.getPlayerList().getPlayers()) {
-                if (other == dead) continue;
-                FAKE_DEAD.add(other.getUUID());
-                other.connection.send(new ClientboundPlayerCombatKillPacket(other.getId(), deathMessage));
+            GameRules gameRules = server.getGameRules();
+            boolean showDeathMessages = gameRules.get(GameRules.SHOW_DEATH_MESSAGES);
+            if (showDeathMessages) {
+                gameRules.set(GameRules.SHOW_DEATH_MESSAGES, false, null);
+            }
+            try {
+                for (ServerPlayer other : server.getPlayerList().getPlayers()) {
+                    if (other == dead || other.isDeadOrDying() || other.isSpectator()) continue;
+                    other.kill(other.level());
+                }
+            } finally {
+                if (showDeathMessages) {
+                    gameRules.set(GameRules.SHOW_DEATH_MESSAGES, true, null);
+                }
             }
         });
-
-        ServerPlayConnectionEvents.DISCONNECT.register((handler, server) ->
-            FAKE_DEAD.remove(handler.player.getUUID())
-        );
 
         LOGGER.info("GroupDeath initialised.");
     }

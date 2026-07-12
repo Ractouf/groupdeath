@@ -14,9 +14,6 @@
 			"com.groupdeath.GroupDeathMod"
 		]
 	},
-	"mixins": [
-		"groupdeath.mixins.json"
-	],
 	"depends": {
 		"fabricloader": ">=0.19.3",
 		"minecraft": "~26.2",
