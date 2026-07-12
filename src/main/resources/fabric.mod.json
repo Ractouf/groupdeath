@@ -1,0 +1,26 @@
+{
+	"schemaVersion": 1,
+	"id": "groupdeath",
+	"version": "${version}",
+	"name": "Group Death",
+	"description": "Shows the death screen to all players when one player dies.",
+	"authors": [
+		"Ractouf"
+	],
+	"license": "MIT",
+	"environment": "server",
+	"entrypoints": {
+		"main": [
+			"com.groupdeath.GroupDeathMod"
+		]
+	},
+	"mixins": [
+		"groupdeath.mixins.json"
+	],
+	"depends": {
+		"fabricloader": ">=0.19.3",
+		"minecraft": "~26.2",
+		"java": ">=25",
+		"fabric-api": "*"
+	}
+}
