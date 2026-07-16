@@ -6,43 +6,52 @@ import net.fabricmc.fabric.api.attachment.v1.AttachmentRegistry;
 import net.fabricmc.fabric.api.attachment.v1.AttachmentType;
 import net.fabricmc.fabric.api.entity.event.v1.ServerLivingEntityEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
+import net.fabricmc.fabric.api.gamerule.v1.GameRuleBuilder;
 import net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents;
 import net.minecraft.network.chat.Component;
 import net.minecraft.network.protocol.game.ClientboundPlayerCombatKillPacket;
 import net.minecraft.resources.Identifier;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.level.gamerules.GameRule;
+import net.minecraft.world.level.gamerules.GameRuleCategory;
 import net.minecraft.world.level.gamerules.GameRules;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
+import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 
 public class GroupDeathMod implements ModInitializer {
 
     public static final String MOD_ID = "groupdeath";
-    public static final Logger LOGGER = LoggerFactory.getLogger(MOD_ID);
 
-    // Server-wide counter, bumped every time a group death is triggered.
     private static final AttachmentType<Integer> GROUP_DEATH_EVENT_ID = AttachmentRegistry.createPersistent(
             Identifier.fromNamespaceAndPath(MOD_ID, "group_death_event_id"), Codec.INT);
 
-    // Per-player marker of the last group death event a player was made to suffer (or was exempt from).
     private static final AttachmentType<Integer> LAST_SEEN_GROUP_DEATH_EVENT_ID = AttachmentRegistry.createPersistent(
             Identifier.fromNamespaceAndPath(MOD_ID, "last_seen_group_death_event_id"), Codec.INT);
 
-    // Text of the death message that triggered the most recent group death, replayed to players who catch up later.
     private static final AttachmentType<String> LAST_GROUP_DEATH_MESSAGE = AttachmentRegistry.createPersistent(
             Identifier.fromNamespaceAndPath(MOD_ID, "last_group_death_message"), Codec.STRING);
 
-    // Guards against re-entering the handler when our own kill() calls fire AFTER_DEATH again.
+    public static final GameRule<Boolean> SHARED_HEALTH_POOL = GameRuleBuilder.forBoolean(false)
+            .category(GameRuleCategory.PLAYER)
+            .buildAndRegister(Identifier.fromNamespaceAndPath(MOD_ID, "shared_health_pool"));
+
+    public static final GameRule<Boolean> MIRROR_DAMAGE = GameRuleBuilder.forBoolean(false)
+            .category(GameRuleCategory.PLAYER)
+            .buildAndRegister(Identifier.fromNamespaceAndPath(MOD_ID, "mirror_damage"));
+
     private static boolean processingGroupDeath = false;
 
-    // Players whose catch-up kill is waiting on their client to finish loading.
+    private static boolean processingMirrorDamage = false;
+
     private static final Set<UUID> pendingCatchUpKills = new HashSet<>();
+
+    private static final Map<UUID, Float> lastKnownHealth = new HashMap<>();
 
     @Override
     public void onInitialize() {
@@ -56,7 +65,6 @@ public class GroupDeathMod implements ModInitializer {
             try {
                 int eventId = server.globalAttachments().getAttachedOrElse(GROUP_DEATH_EVENT_ID, 0) + 1;
                 server.globalAttachments().setAttached(GROUP_DEATH_EVENT_ID, eventId);
-                LOGGER.info("Group death #{} triggered by {}", eventId, dead.getGameProfile().name());
 
                 GameRules gameRules = server.getGameRules();
                 boolean showDeathMessages = gameRules.get(GameRules.SHOW_DEATH_MESSAGES);
@@ -70,7 +78,6 @@ public class GroupDeathMod implements ModInitializer {
                         other.setAttached(LAST_SEEN_GROUP_DEATH_EVENT_ID, eventId);
                         if (other == dead || other.isDeadOrDying() || other.isSpectator()) continue;
                         other.kill(other.level());
-                        LOGGER.info("Group death #{}: killed online player {}", eventId, other.getGameProfile().name());
                         if (showDeathMessages) {
                             other.connection.send(new ClientboundPlayerCombatKillPacket(other.getId(), deathMessage));
                         }
@@ -85,29 +92,39 @@ public class GroupDeathMod implements ModInitializer {
             }
         });
 
-        // Players who were offline during a group death missed their kill; catch them up when they reconnect.
+        ServerLivingEntityEvents.AFTER_DAMAGE.register((entity, source, baseDamageTaken, damageTaken, blocked) -> {
+            if (!(entity instanceof ServerPlayer hurt)) return;
+            MinecraftServer server = hurt.level().getServer();
+            if (server == null) return;
+            GameRules gameRules = server.getGameRules();
+
+            if (!processingMirrorDamage && gameRules.get(MIRROR_DAMAGE)) {
+                processingMirrorDamage = true;
+                try {
+                    for (ServerPlayer other : server.getPlayerList().getPlayers()) {
+                        if (other == hurt || other.isDeadOrDying() || other.isSpectator()) continue;
+                        other.hurtServer(other.level(), source, damageTaken);
+                    }
+                } finally {
+                    processingMirrorDamage = false;
+                }
+            }
+        });
+
         ServerPlayConnectionEvents.JOIN.register((listener, sender, server) -> {
             ServerPlayer player = listener.player;
             int eventId = server.globalAttachments().getAttachedOrElse(GROUP_DEATH_EVENT_ID, 0);
-            String name = player.getGameProfile().name();
 
             if (player.hasAttached(LAST_SEEN_GROUP_DEATH_EVENT_ID)) {
                 int lastSeen = player.getAttachedOrThrow(LAST_SEEN_GROUP_DEATH_EVENT_ID);
-                LOGGER.info("{} joined; last seen group death #{}, current #{}", name, lastSeen, eventId);
                 if (lastSeen < eventId && !player.isSpectator()) {
-                    LOGGER.info("{} missed group death(s) up to #{} while offline; queuing catch-up kill until client finishes loading", name, eventId);
                     pendingCatchUpKills.add(player.getUUID());
                 }
-            } else {
-                LOGGER.info("{} joined with no prior group-death record; baselining to #{}", name, eventId);
             }
 
             player.setAttached(LAST_SEEN_GROUP_DEATH_EVENT_ID, eventId);
         });
 
-        // A player just past JOIN hasn't finished loading their client yet; the server treats them as
-        // invulnerable to all damage until connection.hasClientLoaded() is true, so kill() would silently
-        // no-op if called immediately. Poll until the client is actually ready.
         ServerTickEvents.END_SERVER_TICK.register(server -> {
             if (pendingCatchUpKills.isEmpty()) return;
 
@@ -122,7 +139,6 @@ public class GroupDeathMod implements ModInitializer {
                 if (!player.connection.hasClientLoaded()) continue;
 
                 iterator.remove();
-                String name = player.getGameProfile().name();
                 if (player.isAlive() && !player.isSpectator()) {
                     GameRules gameRules = server.getGameRules();
                     boolean showDeathMessages = gameRules.get(GameRules.SHOW_DEATH_MESSAGES);
@@ -131,7 +147,6 @@ public class GroupDeathMod implements ModInitializer {
                     if (replayMessage) {
                         gameRules.set(GameRules.SHOW_DEATH_MESSAGES, false, null);
                     }
-                    // Prevent this kill from re-triggering AFTER_DEATH and cascading into a fresh group death.
                     processingGroupDeath = true;
                     try {
                         player.kill(player.level());
@@ -144,13 +159,38 @@ public class GroupDeathMod implements ModInitializer {
                             gameRules.set(GameRules.SHOW_DEATH_MESSAGES, true, null);
                         }
                     }
-                    LOGGER.info("Catch-up kill applied to {}", name);
-                } else {
-                    LOGGER.info("Skipped catch-up kill for {} (no longer alive/valid target)", name);
                 }
             }
         });
 
-        LOGGER.info("GroupDeath initialised.");
+        ServerTickEvents.END_SERVER_TICK.register(server -> {
+            if (!server.getGameRules().get(SHARED_HEALTH_POOL)) {
+                if (!lastKnownHealth.isEmpty()) lastKnownHealth.clear();
+                return;
+            }
+
+            Float newPoolValue = null;
+            for (ServerPlayer player : server.getPlayerList().getPlayers()) {
+                if (player.isDeadOrDying() || player.isSpectator() || player.isCreative()) {
+                    lastKnownHealth.remove(player.getUUID());
+                    continue;
+                }
+                float health = player.getHealth();
+                Float last = lastKnownHealth.put(player.getUUID(), health);
+                if (last != null && last != health) {
+                    newPoolValue = health;
+                }
+            }
+
+            if (newPoolValue == null) return;
+            for (ServerPlayer player : server.getPlayerList().getPlayers()) {
+                if (player.isDeadOrDying() || player.isSpectator() || player.isCreative()) continue;
+                float clamped = Math.min(newPoolValue, player.getMaxHealth());
+                if (player.getHealth() != clamped) {
+                    player.setHealth(clamped);
+                    lastKnownHealth.put(player.getUUID(), clamped);
+                }
+            }
+        });
     }
 }
