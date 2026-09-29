@@ -187,6 +187,9 @@ public class GroupDeathMod implements ModInitializer {
                 if (player.isDeadOrDying() || player.isSpectator() || player.isCreative()) continue;
                 float clamped = Math.min(newPoolValue, player.getMaxHealth());
                 if (player.getHealth() != clamped) {
+                    if (clamped < player.getHealth()) {
+                        player.level().broadcastDamageEvent(player, player.damageSources().generic());
+                    }
                     player.setHealth(clamped);
                     lastKnownHealth.put(player.getUUID(), clamped);
                 }
